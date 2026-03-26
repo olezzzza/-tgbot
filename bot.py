@@ -30,7 +30,15 @@ MEMORY_FILE    = "memory.json"
 REMINDERS_FILE = "reminders.json"
 EXPENSES_FILE  = "expenses.json"
 LONGMEM_FILE   = "longmem.json"
+TENDERS_FILE   = "tenders_seen.json"
 DUBLIN_TZ      = ZoneInfo("Europe/Dublin")
+
+TENDER_KEYWORDS = [
+    "software", "ai ", "artificial intelligence", "machine learning",
+    "crm", "digital", "cloud", "saas", "it services", "ict",
+    "voice", "automation", "data", "platform", "app", "system",
+    "technology", "cyber", "analytics", "database", "api",
+]
 
 claude         = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
@@ -216,7 +224,105 @@ def format_longmem() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. НАПОМИНАНИЯ
+# 5. МОНИТОРИНГ ТЕНДЕРОВ (etenders.gov.ie)
+# ═══════════════════════════════════════════════════════════════════
+
+def load_seen_tenders() -> set:
+    if os.path.exists(TENDERS_FILE):
+        with open(TENDERS_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen_tenders(seen: set):
+    with open(TENDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(seen), f)
+
+
+def is_relevant_tender(title: str, description: str = "") -> bool:
+    text = (title + " " + description).lower()
+    return any(kw in text for kw in TENDER_KEYWORDS)
+
+
+def fetch_tenders_rss() -> list:
+    """Получает тендеры через RSS publicprocurement.ie."""
+    items = []
+    try:
+        urls = [
+            "https://publicprocurement.ie/etenders-feed/",
+            "https://www.etenders.gov.ie/epps/cft/listContractDocuments.do?currentType=cft",
+        ]
+        for url in urls:
+            try:
+                content = fetch_url(url)
+                # Парсим RSS вручную (без lxml)
+                titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", content)
+                links  = re.findall(r"<link>(https?://[^<]+)</link>|<link href=[\"'](https?://[^\"']+)[\"']", content)
+                descs  = re.findall(r"<description><!\[CDATA\[(.*?)\]\]></description>|<description>(.*?)</description>", content)
+
+                # Берём только item-записи (пропускаем первый заголовок канала)
+                for i, (t1, t2) in enumerate(titles[1:], 0):
+                    title = (t1 or t2).strip()
+                    link  = links[i][0] or links[i][1] if i < len(links) else ""
+                    desc  = (descs[i][0] or descs[i][1]).strip() if i < len(descs) else ""
+                    if title and title not in ("", "eTenders"):
+                        items.append({"title": title, "link": link, "desc": desc})
+                if items:
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Ошибка RSS тендеров: {e}")
+
+    # Если RSS не дал результатов — ищем через DuckDuckGo
+    if not items:
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(
+                    "site:etenders.gov.ie software AI digital IT services 2025",
+                    max_results=10
+                ):
+                    items.append({
+                        "title": r["title"],
+                        "link":  r["href"],
+                        "desc":  r["body"]
+                    })
+        except Exception as e:
+            print(f"Ошибка поиска тендеров: {e}")
+
+    return items
+
+
+def check_new_tenders() -> list:
+    """Возвращает список новых релевантных тендеров (ещё не виденных)."""
+    seen    = load_seen_tenders()
+    all_t   = fetch_tenders_rss()
+    new_t   = []
+
+    for t in all_t:
+        uid = t["link"] or t["title"]
+        if uid in seen:
+            continue
+        if is_relevant_tender(t["title"], t["desc"]):
+            new_t.append(t)
+            seen.add(uid)
+
+    if new_t:
+        save_seen_tenders(seen)
+    return new_t
+
+
+def format_tender(t: dict) -> str:
+    text = f"📋 *{t['title']}*"
+    if t.get("desc"):
+        text += f"\n{t['desc'][:200]}..."
+    if t.get("link"):
+        text += f"\n🔗 {t['link']}"
+    return text
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. НАПОМИНАНИЯ
 # ═══════════════════════════════════════════════════════════════════
 
 def load_reminders() -> list:
@@ -669,6 +775,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/voice — вкл/выкл голосовые ответы\n"
         "/clear — очистить историю\n"
         "/project — текущий проект\n"
+        "/tenders — проверить тендеры сейчас\n"
         "/check — статус voicecrmapp.com"
     )
 
@@ -776,6 +883,24 @@ async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def facts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/facts — долгосрочная память"""
     await update.message.reply_text(f"🧠 Долгосрочная память:\n\n{format_longmem()}")
+
+
+async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tenders — проверить тендеры прямо сейчас"""
+    await update.message.reply_text("🔍 Проверяю etenders.gov.ie...")
+    try:
+        new_tenders = check_new_tenders()
+        if new_tenders:
+            await update.message.reply_text(f"🏛 Найдено новых тендеров: {len(new_tenders)}")
+            for t in new_tenders:
+                await update.message.reply_text(format_tender(t), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "🏛 Новых подходящих тендеров нет.\n\n"
+                f"Слежу за ключевыми словами:\n{', '.join(TENDER_KEYWORDS)}"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def facebook_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -976,6 +1101,36 @@ async def check_reminders_task(app: Application):
             save_reminders(reminders)
 
 
+async def tenders_monitor(app: Application):
+    """Каждый день в 9:30 проверяет новые тендеры на etenders.gov.ie."""
+    checked_date = None
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(DUBLIN_TZ)
+        if now.hour == 9 and now.minute == 30 and now.date() != checked_date:
+            checked_date = now.date()
+            if not ALLOWED_USER_ID:
+                continue
+            try:
+                new_tenders = check_new_tenders()
+                if new_tenders:
+                    header = f"🏛 Новые тендеры на etenders.gov.ie ({len(new_tenders)}):\n\n"
+                    await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=header)
+                    for t in new_tenders:
+                        await app.bot.send_message(
+                            chat_id=ALLOWED_USER_ID,
+                            text=format_tender(t),
+                            parse_mode="Markdown"
+                        )
+                else:
+                    await app.bot.send_message(
+                        chat_id=ALLOWED_USER_ID,
+                        text="🏛 Новых подходящих тендеров сегодня нет."
+                    )
+            except Exception as e:
+                print(f"Ошибка мониторинга тендеров: {e}")
+
+
 async def evening_report(app: Application):
     """Каждый вечер в 21:00 отправляет итоги дня."""
     report_sent_date = None
@@ -1096,6 +1251,7 @@ def main():
     app.add_handler(CommandHandler("expenses",   expenses_cmd))
     app.add_handler(CommandHandler("facts",      facts_cmd))
     app.add_handler(CommandHandler("facebook",   facebook_cmd))
+    app.add_handler(CommandHandler("tenders",    tenders_cmd))
     app.add_handler(MessageHandler(filters.TEXT  & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO,  handle_photo))
     app.add_handler(MessageHandler(filters.VOICE,  handle_voice))
@@ -1105,6 +1261,7 @@ def main():
         asyncio.create_task(check_reminders_task(app))
         asyncio.create_task(evening_report(app))
         asyncio.create_task(weekly_analysis(app))
+        asyncio.create_task(tenders_monitor(app))
 
     app.post_init = post_init
 
