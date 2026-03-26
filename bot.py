@@ -34,10 +34,13 @@ TENDERS_FILE   = "tenders_seen.json"
 DUBLIN_TZ      = ZoneInfo("Europe/Dublin")
 
 TENDER_KEYWORDS = [
-    "software", "ai ", "artificial intelligence", "machine learning",
-    "crm", "digital", "cloud", "saas", "it services", "ict",
-    "voice", "automation", "data", "platform", "app", "system",
-    "technology", "cyber", "analytics", "database", "api",
+    "construction", "building", "refurbishment", "renovation", "maintenance",
+    "repair", "restoration", "fit-out", "fit out", "fitout",
+    "civil works", "minor works", "small works", "general contractor",
+    "carpentry", "joinery", "painting", "decorating", "plastering",
+    "plumbing", "electrical", "roofing", "flooring", "tiling",
+    "insulation", "landscaping", "groundworks", "drainage",
+    "facilities", "facility management", "handyman", "contractor",
 ]
 
 claude         = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
