@@ -1,30 +1,221 @@
 import os
+import json
 import asyncio
 import httpx
 import base64
 import tempfile
+import urllib.parse
+import urllib.request
+import re
+from io import BytesIO
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 from openai import OpenAI
+from duckduckgo_search import DDGS
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
-MONITOR_URL = os.getenv("MONITOR_URL", "https://voicecrmapp.com")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+ALLOWED_USER_ID   = int(os.getenv("ALLOWED_USER_ID", "0"))
+MONITOR_URL       = os.getenv("MONITOR_URL", "https://voicecrmapp.com")
 
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+TASKS_FILE     = "tasks.json"
+MEMORY_FILE    = "memory.json"
+REMINDERS_FILE = "reminders.json"
+DUBLIN_TZ      = ZoneInfo("Europe/Dublin")
 
-# История диалога и контекст проекта для каждого пользователя
+claude         = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client  = OpenAI(api_key=OPENAI_API_KEY)
+
 conversation_history = {}
-current_project = {}
+current_project      = {}
+voice_mode           = {}   # user_id -> True/False
 
-# ─── Описания агентов ───────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. ПАМЯТЬ МЕЖДУ ПЕРЕЗАПУСКАМИ
+# ═══════════════════════════════════════════════════════════════════
+
+def load_memory():
+    """Загружает историю диалогов из файла при старте."""
+    global conversation_history, current_project, voice_mode
+    if os.path.exists(MEMORY_FILE):
+        try:
+            data = json.load(open(MEMORY_FILE, encoding="utf-8"))
+            # Ключи в JSON — строки, конвертируем в int
+            conversation_history = {int(k): v for k, v in data.get("history", {}).items()}
+            current_project      = {int(k): v for k, v in data.get("project", {}).items()}
+            voice_mode           = {int(k): v for k, v in data.get("voice",   {}).items()}
+        except Exception:
+            pass
+
+
+def save_memory():
+    """Сохраняет историю диалогов в файл."""
+    data = {
+        "history": {str(k): v for k, v in conversation_history.items()},
+        "project": {str(k): v for k, v in current_project.items()},
+        "voice":   {str(k): v for k, v in voice_mode.items()},
+    }
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_history(user_id: int) -> list:
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    hist = conversation_history[user_id]
+    if len(hist) > 20:
+        conversation_history[user_id] = hist[-20:]
+    return conversation_history[user_id]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. ЗАДАЧИ
+# ═══════════════════════════════════════════════════════════════════
+
+def load_tasks() -> list:
+    if os.path.exists(TASKS_FILE):
+        with open(TASKS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_tasks_to_file(tasks: list):
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+
+
+def add_task(description: str, project: str) -> int:
+    tasks = load_tasks()
+    task_id = max((t["id"] for t in tasks), default=0) + 1
+    tasks.append({
+        "id": task_id,
+        "description": description,
+        "project": project,
+        "done": False,
+        "created": datetime.now(DUBLIN_TZ).strftime("%d.%m.%Y %H:%M")
+    })
+    save_tasks_to_file(tasks)
+    return task_id
+
+
+def complete_task(task_id: int) -> bool:
+    tasks = load_tasks()
+    for task in tasks:
+        if task["id"] == task_id:
+            task["done"] = True
+            save_tasks_to_file(tasks)
+            return True
+    return False
+
+
+def format_tasks(show_done=False) -> str:
+    tasks = load_tasks()
+    if not tasks:
+        return "Список задач пуст."
+    icons = {"voicecrm": "🤖", "handyman": "🔨", "general": "💬"}
+    lines = []
+    for t in tasks:
+        if t["done"] and not show_done:
+            continue
+        status = "✅" if t["done"] else "⬜"
+        icon   = icons.get(t["project"], "📌")
+        lines.append(f"{status} [{t['id']}] {icon} {t['description']}  ({t['created']})")
+    return "\n".join(lines) if lines else "Активных задач нет."
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. НАПОМИНАНИЯ
+# ═══════════════════════════════════════════════════════════════════
+
+def load_reminders() -> list:
+    if os.path.exists(REMINDERS_FILE):
+        with open(REMINDERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_reminders(reminders: list):
+    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reminders, f, ensure_ascii=False, indent=2)
+
+
+def add_reminder(user_id: int, text: str, remind_at: datetime) -> int:
+    reminders = load_reminders()
+    rem_id = max((r["id"] for r in reminders), default=0) + 1
+    reminders.append({
+        "id": rem_id,
+        "user_id": user_id,
+        "text": text,
+        "at": remind_at.isoformat(),
+        "sent": False
+    })
+    save_reminders(reminders)
+    return rem_id
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. ИНТЕРНЕТ: ПОИСК И ЧТЕНИЕ СТРАНИЦ
+# ═══════════════════════════════════════════════════════════════════
+
+def web_search(query: str) -> str:
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=5):
+                results.append(f"• {r['title']}\n  {r['body']}\n  Источник: {r['href']}")
+        return "\n\n".join(results) if results else "Результаты не найдены."
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
+
+
+def fetch_url(url: str) -> str:
+    """Загружает страницу и возвращает текст без HTML тегов."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+        content = re.sub(r"<style[^>]*>.*?</style>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<[^>]+>", " ", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        return content[:3000]
+    except Exception as e:
+        return f"Не удалось загрузить страницу: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. ГЕНЕРАЦИЯ КАРТИНОК (DALL-E 3)
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_image(prompt: str) -> bytes | None:
+    """Генерирует картинку через DALL-E 3, возвращает байты PNG."""
+    try:
+        response = openai_client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1,
+            response_format="b64_json"
+        )
+        b64 = response.data[0].b64_json
+        return base64.b64decode(b64)
+    except Exception as e:
+        print(f"Ошибка генерации картинки: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ОПИСАНИЯ АГЕНТОВ
+# ═══════════════════════════════════════════════════════════════════
 
 AGENTS = {
     "voicecrm": {
@@ -39,6 +230,7 @@ AGENTS = {
 - Цель: продать компанию за 10M EUR за 1 год
 - Основатель: Олег Боженко, Дублин, Ирландия
 Помогай с кодом, стратегией, партнёрствами и развитием этого продукта.
+ВАЖНО: если в сообщении есть блок [РЕЗУЛЬТАТЫ ПОИСКА], это реальные данные из интернета — используй их.
 Общайся на русском языке."""
     },
     "handyman": {
@@ -50,6 +242,7 @@ AGENTS = {
 - Генерация текста и картинок через AI
 - Основатель: Олег Боженко, Дублин, Ирландия
 Помогай с контентом, постингом, маркетингом для этого проекта.
+ВАЖНО: если в сообщении есть блок [РЕЗУЛЬТАТЫ ПОИСКА], это реальные данные из интернета — используй их.
 Общайся на русском языке."""
     },
     "general": {
@@ -58,52 +251,219 @@ AGENTS = {
 Олег — предприниматель из Дублина, Ирландия. Строит стартапы.
 Помогай с любыми задачами: программирование, бизнес, анализ, переводы, идеи.
 Анализируй скриншоты и картинки когда их присылают.
+ВАЖНО: если в сообщении есть блок [РЕЗУЛЬТАТЫ ПОИСКА], это реальные актуальные данные из интернета — используй их для ответа, ссылайся на источники.
 Общайся на русском языке."""
     }
 }
 
-ADMIN_SYSTEM = """Ты главный администратор. Твоя задача — определить о каком проекте идёт речь в сообщении пользователя и ответить ТОЛЬКО одним словом:
-- voicecrm — если речь о VoiceCRM AI, голосовой почте, CRM интеграции, Railway, voicecrmapp.com
-- handyman — если речь о Handyman, мастере, услугах, Facebook постинге
-- general — если это общий вопрос не про конкретный проект
 
-Отвечай ТОЛЬКО одним словом без пояснений."""
+# ═══════════════════════════════════════════════════════════════════
+# ОРКЕСТРАТОР
+# ═══════════════════════════════════════════════════════════════════
+
+ORCHESTRATOR_TOOLS = [
+    {
+        "name": "detect_project",
+        "description": "Определить к какому проекту относится сообщение. Вызывай ВСЕГДА первым.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "enum": ["voicecrm", "handyman", "general"]}
+            },
+            "required": ["project"]
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Поиск актуальной информации: новости, цены, документация, события. Используй когда нужны свежие данные.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поисковый запрос"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "fetch_url",
+        "description": (
+            "Открыть любую страницу в интернете. "
+            "Для погоды используй: https://wttr.in/НазваниеГорода?format=4 "
+            "Для курсов валют, любых сайтов — прямой URL."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Полный URL страницы"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "generate_image",
+        "description": "Сгенерировать картинку через DALL-E 3. Используй когда пользователь просит нарисовать, сделать картинку, изображение.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Описание картинки на английском языке для лучшего результата"}
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "save_task",
+        "description": "Сохранить задачу. Используй когда пользователь говорит 'нужно сделать', 'запомни', 'добавь задачу'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "project": {"type": "string", "enum": ["voicecrm", "handyman", "general"]}
+            },
+            "required": ["description", "project"]
+        }
+    },
+    {
+        "name": "get_tasks",
+        "description": "Получить список задач. Используй когда пользователь спрашивает о задачах.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+]
+
+ORCHESTRATOR_SYSTEM = """Ты главный оркестратор Олега Боженко (предприниматель, Дублин, Ирландия).
+
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
+1. ВСЕГДА вызывай detect_project первым.
+2. Нужны актуальные данные? → используй web_search или fetch_url:
+   - Погода → fetch_url: https://wttr.in/НазваниеГорода?format=4
+   - Новости, цены, курсы → web_search
+   - Конкретный сайт → fetch_url
+3. Пользователь просит картинку/изображение → generate_image (промпт на английском)
+4. Пользователь ставит задачу → save_task
+5. Спрашивает о задачах → get_tasks
+
+Не отвечай текстом. Только вызывай инструменты."""
 
 
-# ─── Определение проекта ────────────────────────────────────────────
+def orchestrate(text: str, user_id: int) -> dict:
+    """
+    Оркестратор: определяет проект, при необходимости ищет в интернете,
+    генерирует картинки, сохраняет задачи.
+    """
+    result = {
+        "project":      current_project.get(user_id, "general"),
+        "search_results": None,
+        "image_bytes":  None,
+        "task_saved":   False,
+        "task_id":      None,
+        "tasks_list":   None,
+    }
 
-def detect_project(text: str, user_id: int) -> str:
-    """Определяет проект через Claude"""
-    try:
+    messages = [{"role": "user", "content": text}]
+
+    for _ in range(6):
         response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            system=ADMIN_SYSTEM,
-            messages=[{"role": "user", "content": text}]
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=ORCHESTRATOR_SYSTEM,
+            tools=ORCHESTRATOR_TOOLS,
+            messages=messages
         )
-        project = response.content[0].text.strip().lower()
-        if project in AGENTS:
-            current_project[user_id] = project
-            return project
-    except Exception:
-        pass
-    return current_project.get(user_id, "general")
+
+        if response.stop_reason != "tool_use":
+            break
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            name  = block.name
+            inp   = block.input
+
+            if name == "detect_project":
+                project = inp.get("project", "general")
+                result["project"] = project
+                current_project[user_id] = project
+                tool_result = f"Проект: {project}"
+
+            elif name == "web_search":
+                data = web_search(inp.get("query", ""))
+                result["search_results"] = (result["search_results"] or "") + data
+                tool_result = data
+
+            elif name == "fetch_url":
+                data = fetch_url(inp.get("url", ""))
+                result["search_results"] = (result["search_results"] or "") + data
+                tool_result = data
+
+            elif name == "generate_image":
+                image_bytes = generate_image(inp.get("prompt", ""))
+                result["image_bytes"] = image_bytes
+                tool_result = "Картинка сгенерирована." if image_bytes else "Ошибка генерации."
+
+            elif name == "save_task":
+                task_id = add_task(inp.get("description", ""), inp.get("project", "general"))
+                result["task_saved"] = True
+                result["task_id"] = task_id
+                tool_result = f"Задача #{task_id} сохранена."
+
+            elif name == "get_tasks":
+                tasks_text = format_tasks()
+                result["tasks_list"] = tasks_text
+                tool_result = tasks_text
+
+            else:
+                tool_result = "Неизвестный инструмент."
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": tool_result
+            })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user",      "content": tool_results})
+
+    return result
 
 
-# ─── Ответ через Claude ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ОТВЕТ ЧЕРЕЗ CLAUDE
+# ═══════════════════════════════════════════════════════════════════
 
-def ask_claude(text: str, user_id: int, image_base64: str = None) -> str:
-    project = detect_project(text, user_id)
-    agent = AGENTS[project]
+def ask_claude(text: str, user_id: int, image_base64: str = None, orch: dict = None) -> str:
+    if orch is None:
+        orch = orchestrate(text, user_id)
+
+    # Если просили список задач — возвращаем сразу
+    if orch["tasks_list"]:
+        return f"📋 Список задач:\n\n{orch['tasks_list']}"
+
+    project = orch["project"]
+    agent   = AGENTS[project]
     history = get_history(user_id)
+
+    # Формируем текст с результатами поиска
+    user_text = text
+    if orch["search_results"]:
+        user_text = (
+            f"{text}\n\n"
+            f"[РЕЗУЛЬТАТЫ ПОИСКА — используй эти данные для ответа:]\n"
+            f"{orch['search_results']}\n"
+            f"[КОНЕЦ РЕЗУЛЬТАТОВ]"
+        )
 
     if image_base64:
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
-            {"type": "text", "text": text}
+            {"type": "text",  "text": user_text}
         ]
     else:
-        content = text
+        content = user_text
 
     history.append({"role": "user", "content": content})
 
@@ -115,35 +475,63 @@ def ask_claude(text: str, user_id: int, image_base64: str = None) -> str:
     )
     reply = response.content[0].text
     history.append({"role": "assistant", "content": reply})
+    save_memory()
 
-    # Добавляем подпись какой агент ответил
-    project_label = {"voicecrm": "🤖 VoiceCRM", "handyman": "🔨 Handyman", "general": "💬 Общий"}
-    return f"{project_label.get(project, '')} агент:\n\n{reply}"
-
-
-def get_history(user_id: int):
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-    # Храним только последние 20 сообщений
-    if len(conversation_history[user_id]) > 20:
-        conversation_history[user_id] = conversation_history[user_id][-20:]
-    return conversation_history[user_id]
+    # Добавляем пометки
+    labels        = {"voicecrm": "🤖 VoiceCRM", "handyman": "🔨 Handyman", "general": "💬 Общий"}
+    search_notice = "\n\n🌐 _Использован поиск в интернете._" if orch["search_results"] else ""
+    task_notice   = f"\n\n📌 _Задача #{orch['task_id']} добавлена._" if orch["task_saved"] else ""
+    return f"{labels.get(project, '')} агент:\n\n{reply}{search_notice}{task_notice}"
 
 
-# ─── Команды ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ГОЛОСОВОЙ ОТВЕТ (TTS)
+# ═══════════════════════════════════════════════════════════════════
+
+async def send_voice_reply(update: Update, text: str):
+    """Озвучивает текст через OpenAI TTS и отправляет голосовым сообщением."""
+    try:
+        # Убираем markdown разметку перед озвучкой
+        clean = re.sub(r"[*_`#\[\]()]", "", text)
+        clean = re.sub(r"🤖.*?агент:\n\n", "", clean)
+        clean = clean[:3000]  # TTS лимит
+
+        response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice="nova",
+            input=clean
+        )
+        audio_io = BytesIO(response.content)
+        await update.message.reply_voice(voice=audio_io)
+    except Exception as e:
+        print(f"Ошибка TTS: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДЫ
+# ═══════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я твой AI ассистент с тремя агентами:\n\n"
+        "👋 Привет! Я твой AI ассистент.\n\n"
         "🤖 VoiceCRM — вопросы по voicecrmapp.com\n"
         "🔨 Handyman — Facebook постинг\n"
         "💬 Общий — всё остальное\n\n"
-        "Я сам определяю о каком проекте речь.\n\n"
+        "Что умею:\n"
+        "🌐 Искать в интернете и читать сайты\n"
+        "🎨 Генерировать картинки (попроси нарисовать)\n"
+        "📋 Вести список задач\n"
+        "⏰ Напоминания\n"
+        "🎤 Голосовые ответы\n\n"
         "Команды:\n"
+        "/tasks — список задач\n"
+        "/done 1 — задача #1 выполнена\n"
+        "/remind 09:30 Позвонить клиенту — напоминание\n"
+        "/reminders — список напоминаний\n"
+        "/voice — вкл/выкл голосовые ответы\n"
         "/clear — очистить историю\n"
-        "/project — показать текущий проект\n"
-        "/check — статус voicecrmapp.com\n\n"
-        "Можешь писать текст, присылать фото или голосовые сообщения 🎤"
+        "/project — текущий проект\n"
+        "/check — статус voicecrmapp.com"
     )
 
 
@@ -151,14 +539,89 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
     current_project.pop(user_id, None)
-    await update.message.reply_text("✅ История и контекст проекта очищены.")
+    save_memory()
+    await update.message.reply_text("✅ История очищена.")
 
 
 async def project_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     project = current_project.get(user_id, "не определён")
-    labels = {"voicecrm": "🤖 VoiceCRM AI", "handyman": "🔨 Handyman", "general": "💬 Общий"}
+    labels  = {"voicecrm": "🤖 VoiceCRM AI", "handyman": "🔨 Handyman", "general": "💬 Общий"}
     await update.message.reply_text(f"Текущий проект: {labels.get(project, project)}")
+
+
+async def tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"📋 Задачи:\n\n{format_tasks()}")
+
+
+async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Укажи номер: /done 1")
+        return
+    if complete_task(int(args[0])):
+        await update.message.reply_text(f"✅ Задача #{args[0]} выполнена!")
+    else:
+        await update.message.reply_text(f"❌ Задача #{args[0]} не найдена.")
+
+
+async def voice_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    voice_mode[user_id] = not voice_mode.get(user_id, False)
+    save_memory()
+    status = "включены 🔊" if voice_mode[user_id] else "выключены 🔇"
+    await update.message.reply_text(f"Голосовые ответы {status}")
+
+
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Использование: /remind 09:30 Текст напоминания
+    """
+    user_id = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Формат: /remind 09:30 Позвонить клиенту")
+        return
+
+    time_str = args[0]
+    text     = " ".join(args[1:])
+
+    try:
+        now    = datetime.now(DUBLIN_TZ)
+        hour, minute = map(int, time_str.split(":"))
+        remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Если время уже прошло — ставим на завтра
+        if remind_at <= now:
+            from datetime import timedelta
+            remind_at = remind_at + timedelta(days=1)
+
+        rem_id = add_reminder(user_id, text, remind_at)
+        at_str = remind_at.strftime("%d.%m в %H:%M")
+        await update.message.reply_text(f"⏰ Напоминание #{rem_id} установлено на {at_str}:\n{text}")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}\nФормат: /remind 09:30 Текст")
+
+
+async def reminders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminders = [r for r in load_reminders() if not r["sent"]]
+    if not reminders:
+        await update.message.reply_text("Активных напоминаний нет.")
+        return
+    lines = []
+    for r in reminders:
+        at = datetime.fromisoformat(r["at"]).strftime("%d.%m %H:%M")
+        lines.append(f"⏰ [{r['id']}] {at} — {r['text']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def briefing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет брифинг прямо сейчас по команде /briefing."""
+    await update.message.reply_text("⏳ Собираю брифинг...")
+    try:
+        text = await send_briefing(None)
+        await update.message.reply_text(text)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def check_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,7 +637,9 @@ async def check_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Недоступен: {str(e)[:100]}")
 
 
-# ─── Обработчики сообщений ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ОБРАБОТЧИКИ СООБЩЕНИЙ
+# ═══════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -183,9 +648,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
     try:
-        reply = ask_claude(update.message.text, user_id)
+        orch  = orchestrate(update.message.text, user_id)
+        reply = ask_claude(update.message.text, user_id, orch=orch)
+
+        # Картинка если была сгенерирована
+        if orch["image_bytes"]:
+            await update.message.reply_photo(photo=BytesIO(orch["image_bytes"]))
+
+        # Текстовый ответ
         for chunk in [reply[i:i+4096] for i in range(0, len(reply), 4096)]:
             await update.message.reply_text(chunk)
+
+        # Голосовой ответ если включён
+        if voice_mode.get(user_id) and not orch["tasks_list"]:
+            await send_voice_reply(update, reply)
+
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {str(e)[:200]}")
 
@@ -196,16 +673,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.chat.send_action("typing")
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
+    photo      = update.message.photo[-1]
+    file       = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
-    image_base64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-    caption = update.message.caption or "Опиши что на этом изображении и помоги разобраться."
+    image_b64  = base64.standard_b64encode(file_bytes).decode("utf-8")
+    caption    = update.message.caption or "Опиши что на этом изображении и помоги разобраться."
 
     try:
-        reply = ask_claude(caption, user_id, image_base64)
+        orch  = orchestrate(caption, user_id)
+        reply = ask_claude(caption, user_id, image_base64=image_b64, orch=orch)
         for chunk in [reply[i:i+4096] for i in range(0, len(reply), 4096)]:
             await update.message.reply_text(chunk)
+        if voice_mode.get(user_id):
+            await send_voice_reply(update, reply)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {str(e)[:200]}")
 
@@ -215,43 +695,101 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
         return
 
-    await update.message.reply_text("🎤 Расшифровываю голосовое...")
+    await update.message.reply_text("🎤 Расшифровываю...")
     await update.message.chat.send_action("typing")
 
     try:
-        # Скачиваем голосовое
-        voice = update.message.voice
-        file = await context.bot.get_file(voice.file_id)
+        voice      = update.message.voice
+        file       = await context.bot.get_file(voice.file_id)
         file_bytes = await file.download_as_bytearray()
 
-        # Сохраняем во временный файл
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
-        # Расшифровываем через Whisper
         with open(tmp_path, "rb") as audio_file:
             transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
+                model="whisper-1", file=audio_file
             )
         os.unlink(tmp_path)
 
         text = transcript.text
-        await update.message.reply_text(f"📝 Расшифровка: {text}")
+        await update.message.reply_text(f"📝 {text}")
 
-        # Отправляем в Claude
-        reply = ask_claude(text, user_id)
+        orch  = orchestrate(text, user_id)
+        reply = ask_claude(text, user_id, orch=orch)
+        if orch["image_bytes"]:
+            await update.message.reply_photo(photo=BytesIO(orch["image_bytes"]))
         for chunk in [reply[i:i+4096] for i in range(0, len(reply), 4096)]:
             await update.message.reply_text(chunk)
+        if voice_mode.get(user_id):
+            await send_voice_reply(update, reply)
 
     except Exception as e:
-        await update.message.reply_text(f"Ошибка расшифровки: {str(e)[:200]}")
+        await update.message.reply_text(f"Ошибка: {str(e)[:200]}")
 
 
-# ─── Мониторинг домена ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ФОНОВЫЕ ЗАДАЧИ
+# ═══════════════════════════════════════════════════════════════════
+
+async def send_briefing(bot) -> str:
+    """Формирует и отправляет утренний брифинг. Возвращает текст брифинга."""
+    weather = fetch_url("https://wttr.in/Dublin?format=4")
+    tasks   = format_tasks()
+    text = (
+        f"☀️ Доброе утро, Олег!\n\n"
+        f"🌤 Погода в Дублине:\n{weather}\n\n"
+        f"📋 Активные задачи:\n{tasks}"
+    )
+    if bot and ALLOWED_USER_ID:
+        await bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
+    return text
+
+
+async def morning_briefing(app: Application):
+    """Каждое утро в 8:00–8:04 по Дублину отправляет брифинг."""
+    briefing_sent_date = None
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(DUBLIN_TZ)
+        if now.hour == 8 and now.minute < 5 and now.date() != briefing_sent_date:
+            briefing_sent_date = now.date()
+            if not ALLOWED_USER_ID:
+                continue
+            try:
+                await send_briefing(app.bot)
+            except Exception as e:
+                print(f"Ошибка брифинга: {e}")
+
+
+async def check_reminders_task(app: Application):
+    """Каждую минуту проверяет напоминания."""
+    while True:
+        await asyncio.sleep(60)
+        now       = datetime.now(DUBLIN_TZ)
+        reminders = load_reminders()
+        changed   = False
+        for r in reminders:
+            if r["sent"]:
+                continue
+            remind_at = datetime.fromisoformat(r["at"])
+            if now >= remind_at:
+                try:
+                    await app.bot.send_message(
+                        chat_id=r["user_id"],
+                        text=f"⏰ Напоминание:\n\n{r['text']}"
+                    )
+                    r["sent"] = True
+                    changed   = True
+                except Exception as e:
+                    print(f"Ошибка напоминания: {e}")
+        if changed:
+            save_reminders(reminders)
+
 
 async def monitor_domain(app: Application):
+    """Каждые 5 минут проверяет доступность voicecrmapp.com."""
     domain_was_down = True
     while True:
         await asyncio.sleep(300)
@@ -271,20 +809,32 @@ async def monitor_domain(app: Application):
             domain_was_down = True
 
 
-# ─── Запуск ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ═══════════════════════════════════════════════════════════════════
 
 def main():
+    load_memory()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("project", project_status))
-    app.add_handler(CommandHandler("check", check_domain))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("clear",      clear))
+    app.add_handler(CommandHandler("project",    project_status))
+    app.add_handler(CommandHandler("check",      check_domain))
+    app.add_handler(CommandHandler("tasks",      tasks_list))
+    app.add_handler(CommandHandler("done",       done_task))
+    app.add_handler(CommandHandler("voice",      voice_toggle))
+    app.add_handler(CommandHandler("briefing",   briefing_cmd))
+    app.add_handler(CommandHandler("remind",     remind_cmd))
+    app.add_handler(CommandHandler("reminders",  reminders_list))
+    app.add_handler(MessageHandler(filters.TEXT  & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO,  handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE,  handle_voice))
 
     async def post_init(app: Application):
+        asyncio.create_task(morning_briefing(app))
+        asyncio.create_task(check_reminders_task(app))
         asyncio.create_task(monitor_domain(app))
 
     app.post_init = post_init
