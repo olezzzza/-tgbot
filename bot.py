@@ -835,7 +835,6 @@ def main():
     async def post_init(app: Application):
         asyncio.create_task(morning_briefing(app))
         asyncio.create_task(check_reminders_task(app))
-        asyncio.create_task(monitor_domain(app))
 
     app.post_init = post_init
 
